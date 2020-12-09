@@ -93,6 +93,41 @@ from .training_args import TrainingArguments
 from .utils import logging
 
 
+from collections import OrderedDict, namedtuple
+from itertools import cycle
+
+import torchprof
+
+
+Measure = namedtuple("Measure", ["self_cpu_total", "cpu_total", "cuda_total", "occurrences"])
+
+
+def collect_prof_results(prof, paths=None):
+    # https://github.com/awwong1/torchprof/blob/master/torchprof/profile.py#L116
+    traces, trace_events = prof.raw()
+    tree = OrderedDict()
+
+    for trace in traces:
+        [path, leaf, module] = trace
+        current_tree = tree
+        # unwrap all of the events, in case model is called multiple times
+        events = [te for tevents in trace_events[path] for te in tevents]
+        for depth, name in enumerate(path, 1):
+            if name not in current_tree:
+                current_tree[name] = OrderedDict()
+            if depth == len(path) and (
+                (paths is None and leaf) or (paths is not None and path in paths)
+            ):
+                # tree measurements have key None, avoiding name conflict
+                current_tree[name][None] = Measure(
+                    sum([e.self_cpu_time_total for e in events]),
+                    sum([e.cpu_time_total for e in events]),
+                    sum([e.cuda_time_total for e in events]),
+                    len(trace_events[path])
+                )
+    return tree
+
+
 _use_native_amp = False
 _use_apex = False
 
@@ -1561,3 +1596,54 @@ class Trainer:
         else:
             model = model
         return model
+
+    def profile(self, eval_dataset, ignore_keys, warmup=10, repeat=100, number=30):
+        if eval_dataset is not None and not isinstance(eval_dataset, collections.abc.Sized):
+            raise ValueError("eval_dataset must implement __len__")
+
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        
+        output = self.profiling_loop(
+            eval_dataloader,
+            description="Profiling",
+            # No point gathering the predictions if there are no metrics, otherwise we defer to
+            # self.args.prediction_loss_only
+            prediction_loss_only=True if self.compute_metrics is None else None,
+            ignore_keys=ignore_keys,
+            warmup=warmup,
+            repeat=repeat,
+            number=number,
+        )
+
+        self.log(output.metrics)
+        return output.metrics
+
+    def profiling_loop(self, dataloader, description, prediction_loss_only, ignore_keys, warmup, repeat, number):
+        if not isinstance(dataloader.dataset, collections.abc.Sized):
+            raise ValueError("dataset must implement __len__")
+        prediction_loss_only = (
+            prediction_loss_only if prediction_loss_only is not None else self.args.prediction_loss_only
+        )
+
+        model = self.model
+
+        batch_size = dataloader.batch_size
+        num_examples = self.num_examples(dataloader)
+        logger.info("***** Running %s *****", description)
+        logger.info("  Num examples = %d", num_examples)
+        logger.info("  Batch size = %d", batch_size)
+
+        model = model.eval()
+        loader = iter(cycle(dataloader))
+
+        for _ in range(warmup):
+            self.prediction_step(model, next(loader), prediction_loss_only, ignore_keys=ignore_keys)
+
+        profile_results = list()
+        for _ in range(repeat):
+            with torchprof.Profile(model, use_cuda=True) as prof:
+                for _ in range(number):
+                    self.prediction_step(model, next(loader), prediction_loss_only, ignore_keys=ignore_keys)
+            profile_results.append(collect_prof_results(prof))
+
+        return profile_results
