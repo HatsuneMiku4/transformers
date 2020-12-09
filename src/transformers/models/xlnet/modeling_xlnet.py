@@ -207,6 +207,13 @@ def load_tf_weights_in_xlnet(model, config, tf_path):
     return model
 
 
+class EinSum(nn.Module):
+    def __init__(self, einsum_expr):
+        self.expr = einsum_expr
+    
+    def forward(self, a, b):
+        return 
+
 class XLNetRelativeAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -235,6 +242,13 @@ class XLNetRelativeAttention(nn.Module):
 
         self.layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.dropout)
+
+        self.softmax = nn.Softmax(dim=3)
+        self.cont_attn = EinSum("ibnd,jbnd->bnij")
+        self.posi_attn = EinSum("ibnd,jbnd->bnij")
+        self.atten_out = EinSum("bnij,jbnd->ibnd")
+        self.seg_attn1 = EinSum("ibnd,snd->ibns")
+        self.seg_attn2 = EinSum("ijbs,ibns->bnij")
 
     def prune_heads(self, heads):
         raise NotImplementedError
@@ -281,18 +295,18 @@ class XLNetRelativeAttention(nn.Module):
         """Core relative positional attention operations."""
 
         # content based attention score
-        ac = torch.einsum("ibnd,jbnd->bnij", q_head + self.r_w_bias, k_head_h)
+        ac = self.cont_attn(q_head + self.r_w_bias, k_head_h)
 
         # position based attention score
-        bd = torch.einsum("ibnd,jbnd->bnij", q_head + self.r_r_bias, k_head_r)
+        bd = self.posi_attn(q_head + self.r_r_bias, k_head_r)
         bd = self.rel_shift_bnij(bd, klen=ac.shape[3])
 
         # segment based attention score
         if seg_mat is None:
             ef = 0
         else:
-            ef = torch.einsum("ibnd,snd->ibns", q_head + self.r_s_bias, self.seg_embed)
-            ef = torch.einsum("ijbs,ibns->bnij", seg_mat, ef)
+            ef = self.seg_attn1(q_head + self.r_s_bias, self.seg_embed)
+            ef = self.seg_attn2(seg_mat, ef)
 
         # merge attention scores and perform masking
         attn_score = (ac + bd + ef) * self.scale
@@ -304,7 +318,7 @@ class XLNetRelativeAttention(nn.Module):
                 attn_score = attn_score - 1e30 * torch.einsum("ijbn->bnij", attn_mask)
 
         # attention probability
-        attn_prob = F.softmax(attn_score, dim=3)
+        attn_prob = self.softmax(attn_score)
         attn_prob = self.dropout(attn_prob)
 
         # Mask heads if we want to
@@ -312,7 +326,7 @@ class XLNetRelativeAttention(nn.Module):
             attn_prob = attn_prob * torch.einsum("ijbn->bnij", head_mask)
 
         # attention output
-        attn_vec = torch.einsum("bnij,jbnd->ibnd", attn_prob, v_head_h)
+        attn_vec = self.atten_out(attn_prob, v_head_h)
 
         if output_attentions:
             return attn_vec, torch.einsum("bnij->ijbn", attn_prob)

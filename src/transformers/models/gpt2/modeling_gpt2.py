@@ -120,6 +120,14 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
     return model
 
 
+class MatMul(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, a, b):
+        return torch.matmul(a, b)
+
+
 class Attention(nn.Module):
     def __init__(self, nx, n_ctx, config, scale=False, is_cross_attention=False):
         super().__init__()
@@ -145,6 +153,10 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
         self.pruned_heads = set()
 
+        self.softmax = nn.Softmax(dim=-1)
+        self.matmul_qk = MatMul()
+        self.matmul_wv = MatMul()
+
     def prune_heads(self, heads):
         if len(heads) == 0:
             return
@@ -163,7 +175,7 @@ class Attention(nn.Module):
         self.pruned_heads = self.pruned_heads.union(heads)
 
     def _attn(self, q, k, v, attention_mask=None, head_mask=None, output_attentions=False):
-        w = torch.matmul(q, k)
+        w = self.matmul_qk(q, k)
         if self.scale:
             w = w / (float(v.size(-1)) ** 0.5)
         nd, ns = w.size(-2), w.size(-1)
@@ -177,14 +189,14 @@ class Attention(nn.Module):
             # Apply the attention mask
             w = w + attention_mask
 
-        w = nn.Softmax(dim=-1)(w)
+        w = self.softmax(w)
         w = self.attn_dropout(w)
 
         # Mask heads if we want to
         if head_mask is not None:
             w = w * head_mask
 
-        outputs = [torch.matmul(w, v)]
+        outputs = [self.matmul_wv(w, v)]
         if output_attentions:
             outputs.append(w)
         return outputs
