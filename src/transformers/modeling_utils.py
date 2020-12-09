@@ -1169,28 +1169,67 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
         return model
 
 
-class Conv1D(nn.Module):
-    """
-    1D-convolutional layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2).
+# class Conv1D(nn.Module):
+#     """
+#     1D-convolutional layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2).
 
-    Basically works like a linear layer but the weights are transposed.
+#     Basically works like a linear layer but the weights are transposed.
 
-    Args:
-        nf (:obj:`int`): The number of output features.
-        nx (:obj:`int`): The number of input features.
-    """
+#     Args:
+#         nf (:obj:`int`): The number of output features.
+#         nx (:obj:`int`): The number of input features.
+#     """
 
-    def __init__(self, nf, nx):
+#     def __init__(self, nf, nx):
+#         super().__init__()
+#         self.nf = nf
+#         w = torch.empty(nx, nf)
+#         nn.init.normal_(w, std=0.02)
+#         self.weight = nn.Parameter(w)
+#         self.bias = nn.Parameter(torch.zeros(nf))
+
+#     def forward(self, x):
+#         size_out = x.size()[:-1] + (self.nf,)
+#         x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+#         x = x.view(*size_out)
+#         return x
+
+
+class Linear(nn.Module):
+    def __init__(self, nx, nf):
         super().__init__()
-        self.nf = nf
         w = torch.empty(nx, nf)
         nn.init.normal_(w, std=0.02)
         self.weight = nn.Parameter(w)
+
+    def forward(self, x):
+        return torch.matmul(x, self.weight)
+
+
+class BiasAdd(nn.Module):
+    def __init__(self, nf):
+        super().__init__()
+        self.nf = nf
         self.bias = nn.Parameter(torch.zeros(nf))
+    
+    def forward(self, x):
+        return x + self.bias
+
+
+class Conv1D(nn.Module):
+    def __init__(self, nf, nx):
+        super().__init__()
+        self.nf = nf
+        self.gemm = Linear(nx, nf)
+        self.bias_add = BiasAdd(nf)
+        # hack state dict loading
+        self.weight = self.gemm.weight
+        self.bias = self.bias_add.bias
 
     def forward(self, x):
         size_out = x.size()[:-1] + (self.nf,)
-        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+        x = x.view(-1, x.size(-1))
+        x = self.bias_add(self.gemm(x))
         x = x.view(*size_out)
         return x
 
